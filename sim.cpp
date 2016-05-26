@@ -61,6 +61,9 @@ void simulate_all_params (input_params& ip, rates& rs, sim_data& sd, double** se
 		sets_passed += determine_set_passed(sd, i, score[i]); // Calculate the maximum score and whether the set passed
 	}
 	
+	cl.clear();
+	baby_cl.clear();
+	
 	// Pipe the scores if piping specified by the user
 	if (ip.piping) {
 		write_pipe(score, ip, sd);
@@ -169,6 +172,11 @@ int simulate_section (int set_num, input_params& ip, sim_data& sd, rates& rs, co
 	
 	// Simulate each mutant
 	for (int i = 0; i < ip.num_active_mutants; i++) {
+		//20160519: Ha added this if, because if the posterior did not pass the test, then there is no point in checking the anterior. Also, because in simulate_mutant right now, only when the posterior has max_score then then anterior can have baby_cl copied to mutant.
+		if (sd.section== SEC_ANT && scores[i]==0){
+				scores[ip.num_active_mutants + i] =0;
+				continue;
+		}
 		mutant_sim_message(mds[i], sd.section);//Ha: i-> sd->section
 		store_original_rates(rs, mds[i], temp_rates); // will be used to revert original rates after current mutant
 		knockout (rs, mds[i], 0);// no overexpression yet, so induction=0. change the rs.rates_cell table based on how many knockouts in mds[i]
@@ -197,10 +205,10 @@ int simulate_section (int set_num, input_params& ip, sim_data& sd, rates& rs, co
 void determine_start_end (sim_data& sd) {
 	if (sd.section == SEC_POST) {
 		sd.time_start = 1;
-		sd.time_end = MIN(sd.steps_til_growth + 1, sd.steps_total);
+		sd.time_end = MIN(sd.steps_til_growth + 1, sd.steps_total);// /sd.big_gran;
 	} else {
-		sd.time_start = sd.max_delay_size;
-		sd.time_end = sd.max_delay_size + sd.steps_total - sd.steps_til_growth;
+		sd.time_start = (sd.steps_til_growth + 1);// /sd.big_gran;
+		sd.time_end = sd.steps_total;// /sd.big_gran;
 	}
 }
 
@@ -210,7 +218,7 @@ void determine_start_end (sim_data& sd) {
 		mds: the array of all mutant data
 	returns: nothing
 	notes:
-	todo: 20160519: Ask about the mds[Wildtype] part, then get it of it coz right now it does not make sense to Ha
+	todo: 20160519: Ask about the mds[Wildtype] part, then get rid of it coz right now it does not make sense to Ha
 */
 void reset_mutant_scores (input_params& ip, mutant_data mds[]) {
 	for (int i = 0; i < ip.num_active_mutants; i++) {
@@ -315,11 +323,12 @@ inline void revert_knockout (rates& rs, mutant_data& md, double orig_rates[]) {
 */
 double simulate_mutant (int set_num, input_params& ip, sim_data& sd, rates& rs, con_levels& cl, con_levels& baby_cl, mutant_data& md, features& wtfeat, char* dirname_cons, double temp_rates[2]) {
 	reset_seed(ip, sd); // Reset the seed for each mutant
+	cl.reset();
 	baby_cl.reset(); // Reset the concentrations levels used for simulating
 	perturb_rates_all(rs); // Perturb the rates of all starting cells
 	
 	// Initialize active record data and neighbor calculations
-	sd.initialize_active_data();
+	sd.initialize_active_data();// whether sd.section is POS or ANT, the width_current, active_start and active_end at the beginning of POS and ANT are the same: width_current= width_initial, active_start= width_initial - 1, active_end = 0
 	if (sd.height > 1) {
 		calc_neighbors_2d(sd);
 	}
@@ -385,11 +394,11 @@ double simulate_mutant (int set_num, input_params& ip, sim_data& sd, rates& rs, 
 		}
 		
 		if (score == max_score) {
+			term->verbose() << term->blue;
 			// Copy the concentration levels to the mutant data if this is a posterior simulation (if short circuiting)
 			if (!sd.no_growth && sd.section == SEC_POST && ip.short_circuit) {
 				copy_cl_to_mutant(sd, baby_cl, md);
 			}
-			term->verbose() << term->blue;
 		} else {
 			term->verbose() << term->red;
 		}
@@ -397,6 +406,7 @@ double simulate_mutant (int set_num, input_params& ip, sim_data& sd, rates& rs, 
 	} else {
 		term->verbose() << term->red << "failed to complete the simulation";
 	}
+	
 	term->verbose() << term->reset << endl;
 	return score;
 }
@@ -413,10 +423,11 @@ double simulate_mutant (int set_num, input_params& ip, sim_data& sd, rates& rs, 
 	todo:
 */
 bool model (sim_data& sd, rates& rs, con_levels& cl, con_levels& baby_cl, mutant_data& md, double temp_rates[2]) {
-	int steps_elapsed = sd.steps_split; // Used to determine when to split a column of cells
+	int steps_elapsed = 0; // Used to determine when to split a column of cells
 	update_rates(rs, sd.active_start); // Update the active rates based on the base rates, perturbations, and gradients. 
 	
 	// Iterate through each time step
+	bool passed = true;
 	int j; // Absolute time used by cl
 	int baby_j; // Cyclical time used by baby_cl
 	bool past_induction = false; // Whether we've passed the point of induction of knockouts or overexpression
@@ -453,16 +464,25 @@ bool model (sim_data& sd, rates& rs, con_levels& cl, con_levels& baby_cl, mutant
 				
 				// Perform biological calculations
 				st_context stc(time_prev, baby_j, k);
-				protein_synthesis(sd, rs.rates_active, baby_cl, stc, old_cells_protein);
-				dimer_proteins(sd, rs.rates_active, baby_cl, stc);
-				mRNA_synthesis(sd, rs.rates_active, baby_cl, stc, old_cells_mrna, md, past_induction, past_recovery);
+				passed = protein_synthesis(sd, rs.rates_active, baby_cl, stc, old_cells_protein);
+				if (!passed){
+					return false;
+				}
+				passed = dimer_proteins(sd, rs.rates_active, baby_cl, stc);
+				if (!passed){
+					return false;
+				}
+				passed = mRNA_synthesis(sd, rs.rates_active, baby_cl, stc, old_cells_mrna, md, past_induction, past_recovery);
+				if (!passed){
+					return false;
+				}
 			}
 		}
 		
-		// Check to make sure the numbers are still valid
-		if (any_less_than_0(baby_cl, baby_j) || concentrations_too_high(baby_cl, baby_j, sd.max_con_thresh)) {
-			return false;
-		}
+		// Check to make sure the numbers are still valid. This should 
+		//if (check_concentration_bound(baby_cl, baby_j, sd.max_con_thresh)) {
+		//	return false;
+		//}
 		
 		// Split cells periodically in anterior simulations
 		if (sd.section == SEC_ANT && (steps_elapsed % sd.steps_split) == 0) {
@@ -546,7 +566,7 @@ inline int index_with_splits (sim_data& sd, con_levels& cl, int baby_time, int t
 	notes:
 		This function checks only the first cell's concentrations for the sake of speed
 	todo:
-*/
+
 inline bool any_less_than_0 (con_levels& cl, int time) {
 	for (int i = MIN_CON_LEVEL; i <= MAX_CON_LEVEL; i++) {
 		if (cl.cons[i][time][0] < 0) { // This checks only the first cell
@@ -555,7 +575,7 @@ inline bool any_less_than_0 (con_levels& cl, int time) {
 	}
 	return false;
 }
-
+*/
 /* concentrations_too_high checks if any concentrations are higher than the given maximum threshold
 	parameters:
 		cl: the concentration levels used for analysis and storage
@@ -566,16 +586,25 @@ inline bool any_less_than_0 (con_levels& cl, int time) {
 		This function checks only the first cell's concentrations for the sake of speed
 	todo:
 */
-inline bool concentrations_too_high (con_levels& cl, int time, double max_con_thresh) {
+/*
+inline bool check_concentration_bound (con_levels& cl, int time, double max_con_thresh) {
 	if (max_con_thresh != INFINITY) {
 		for (int i = MIN_CON_LEVEL; i <= MAX_CON_LEVEL; i++) {
-			if (cl.cons[i][time][0] > max_con_thresh) { // This checks only the first cell
+			if (cl.cons[i][time][0] > max_con_thresh || cl.cons[i][time][0] <0) { // This checks only the first cell
+				return true;
+			}
+		}
+	}
+	else{
+		for (int i=MIN_CON_LEVEL ; i<= MAX_CON_LEVEL ; i ++){
+			if (cl.cons[i][time][0]<0){
 				return true;
 			}
 		}
 	}
 	return false;
 }
+*/
 
 /* split splits the posterior-most column of cells
 	parameters:
@@ -711,7 +740,7 @@ void update_rates (rates& rs, int active_start) {
 
 	151221: Added prtein synthesis for mespa and mespb
 */
-void protein_synthesis (sim_data& sd, double** rs, con_levels& baby_cl, st_context& stc, int old_cells_protein[]) {
+bool protein_synthesis (sim_data& sd, double** rs, con_levels& baby_cl, st_context& stc, int old_cells_protein[]) {
 	double dimer_effects[NUM_HER_INDICES] = {0}; // Heterodimer calculations
 	di_args dia(rs, baby_cl, stc, dimer_effects); // WRAPper for repeatedly used structs
 	cp_args cpa(sd, rs, baby_cl, stc, old_cells_protein, dimer_effects); // WRAPper for repeatedly used indices
@@ -726,17 +755,21 @@ void protein_synthesis (sim_data& sd, double** rs, con_levels& baby_cl, st_conte
 		dim_int(dia, di_indices(CPH1, CPMESPB, CPH1MESPB, RDAH1MESPB, RDDIH1MESPB, IH1));
 	}*/
 	dim_int(dia, di_indices(CPH1, CPH13, CPH1H13, RDAH1H13, RDDIH1H13, IH1));
-	con_protein_her(cpa, cph_indices(CMH1, CPH1, CPH1H1, RPSH1, RPDH1, RDAH1H1, RDDIH1H1, RDELAYPH1, IH1, IPH1));
-	
-	// Her7
+	bool passed = con_protein_her(cpa, cph_indices(CMH1, CPH1, CPH1H1, RPSH1, RPDH1, RDAH1H1, RDDIH1H1, RDELAYPH1, IH1, IPH1));
+	if (!passed){
+		return false;
+	}
+	// Her7 interacting with Her1 and Her13
 	dim_int(dia, di_indices(CPH7, CPH1,  CPH1H7,  RDAH1H7,  RDDIH1H7,  IH7));
 	/*if (sd.section == SEC_ANT) {
 		dim_int(dia, di_indices(CPH7, CPMESPA, CPH7MESPA, RDAH7MESPA, RDDIH7MESPA, IH7));
 		dim_int(dia, di_indices(CPH7, CPMESPB, CPH7MESPB, RDAH7MESPB, RDDIH7MESPB, IH7));
 	}*/
 	dim_int(dia, di_indices(CPH7, CPH13, CPH7H13, RDAH7H13, RDDIH7H13, IH7));
-	con_protein_her(cpa, cph_indices(CMH7, CPH7, CPH7H7, RPSH7, RPDH7, RDAH7H7, RDDIH7H7, RDELAYPH7, IH7, IPH7));
-	
+	passed = con_protein_her(cpa, cph_indices(CMH7, CPH7, CPH7H7, RPSH7, RPDH7, RDAH7H7, RDDIH7H7, RDELAYPH7, IH7, IPH7));
+	if (!passed){
+		return false;
+	}
 	
 	// Since MespA and MespB are only expressed in the anterior, we can skip calculating Mesp protein level in posterior stage. All set to 0.
 	if (sd.section == SEC_ANT) {
@@ -745,14 +778,19 @@ void protein_synthesis (sim_data& sd, double** rs, con_levels& baby_cl, st_conte
 		//dim_int(dia, di_indices(CPMESPA, CPH7,  CPH7MESPA,  RDAH7MESPA,  RDDIH7MESPA,  IMESPA));
 		dim_int(dia, di_indices(CPMESPA, CPMESPB, CPMESPAMESPB, RDAMESPAMESPB, RDDIMESPAMESPB, IMESPA));
 		//dim_int(dia, di_indices(CPMESPA, CPH13, CPMESPAH13, RDAMESPAH13, RDDIMESPAH13, IMESPA));
-		con_protein_her(cpa, cph_indices(CMMESPA, CPMESPA, CPMESPAMESPA, RPSMESPA, RPDMESPA, RDAMESPAMESPA, RDDIMESPAMESPA, RDELAYPMESPA, IMESPA, IPMESPA));
-
+		passed= con_protein_her(cpa, cph_indices(CMMESPA, CPMESPA, CPMESPAMESPA, RPSMESPA, RPDMESPA, RDAMESPAMESPA, RDDIMESPAMESPA, RDELAYPMESPA, IMESPA, IPMESPA));
+		if (! passed){
+			return false;
+		}
 		// MespB
 		//dim_int(dia, di_indices(CPMESPB, CPH1,  CPH1MESPB,  RDAH1MESPB,  RDDIH1MESPB,  IMESPB));
 		//dim_int(dia, di_indices(CPMESPB, CPH7,  CPH7MESPB,  RDAH7MESPB,  RDDIH7MESPB,  IMESPB));
 		dim_int(dia, di_indices(CPMESPB, CPMESPA, CPMESPAMESPB, RDAMESPAMESPB, RDDIMESPAMESPB, IMESPB));
 		//dim_int(dia, di_indices(CPMESPB, CPH13, CPMESPBH13, RDAMESPBH13, RDDIMESPBH13, IMESPB));
-		con_protein_her(cpa, cph_indices(CMMESPB, CPMESPB, CPMESPBMESPB, RPSMESPB, RPDMESPB, RDAMESPBMESPB, RDDIMESPBMESPB, RDELAYPMESPB, IMESPB, IPMESPB));
+		passed = con_protein_her(cpa, cph_indices(CMMESPB, CPMESPB, CPMESPBMESPB, RPSMESPB, RPDMESPB, RDAMESPBMESPB, RDDIMESPBMESPB, RDELAYPMESPB, IMESPB, IPMESPB));
+		if (!passed){
+			return false;
+		}
 	}
 
 	// Her13
@@ -762,12 +800,19 @@ void protein_synthesis (sim_data& sd, double** rs, con_levels& baby_cl, st_conte
 		dim_int(dia, di_indices(CPH13, CPMESPA, CPMESPAH13, RDAMESPAH13, RDDIMESPAH13, IH13));
 		dim_int(dia, di_indices(CPH13, CPMESPB, CPMESPBH13, RDAMESPBH13, RDDIMESPBH13, IH13));
 	}*/
-	con_protein_her(cpa, cph_indices(CMH13, CPH13, CPH13H13, RPSH13, RPDH13, RDAH13H13, RDDIH13H13, RDELAYPH13, IH13, IPH13));
-	
+	passed = con_protein_her(cpa, cph_indices(CMH13, CPH13, CPH13H13, RPSH13, RPDH13, RDAH13H13, RDDIH13H13, RDELAYPH13, IH13, IPH13));
+	if (!passed){
+		return false;
+	}
 	/// Nondimerizing genes
 	
 	// Delta
-	con_protein_delta(cpa, cpd_indices(CMDELTA, CPDELTA, RPSDELTA, RPDDELTA, RDELAYPDELTA, IPDELTA));
+	passed = con_protein_delta(cpa, cpd_indices(CMDELTA, CPDELTA, RPSDELTA, RPDDELTA, RDELAYPDELTA, IPDELTA));
+	if (!passed){
+		return false;
+	}
+	
+	return true;
 }
 
 /* dim_int calculates the dimer interactions for a given protein (a step in protein_synthesis)
@@ -799,7 +844,7 @@ inline void dim_int (di_args& a, di_indices dii) {
 	notes: 20160518: Ha: check back after understanding the model whether td is calculated correctly
 	todo:
 */
-inline void con_protein_her (cp_args& a, cph_indices i) {
+inline bool con_protein_her (cp_args& a, cph_indices i) {
 	double** r = a.rs;	//active_rates
 	double*** c = a.cl.cons;	//(baby_cl)3D table of concentration of different things in diff cells at diff time_steps
 	int cell = a.stc.cell;		//index of the cell
@@ -809,13 +854,21 @@ inline void con_protein_her (cp_args& a, cph_indices i) {
 	int td = WRAP(tc - delay_steps, a.sd.max_delay_size);	// how many steps are we in the delay cycle
 	
 	// The part of the given Her protein concentration's differential equation that accounts for everything but heterodimers, whose influence is calculated in dim_int
-	c[i.con_protein][tc][cell] =
+	double result =
 		c[i.con_protein][tp][cell]
 		+ a.sd.step_size * (r[i.rate_synthesis][cell] * c[i.con_mrna][td][a.old_cells[i.old_cell]]
 		- r[i.rate_degradation][cell] * c[i.con_protein][tp][cell]
 		- 2 * r[i.rate_association][cell] * SQUARE(c[i.con_protein][tp][cell])
 		+ 2 * r[i.rate_dissociation][cell] * c[i.con_dimer][tp][cell]
 		+ a.dimer_effects[i.dimer_effect]);
+	
+	c[i.con_protein][tc][cell] = result;
+	if (result <0 or result > a.sd.max_con_thresh){
+		return false;
+	}
+	else{
+		return true;
+	}
 }
 
 /* con_protein_delta calculates the protein concentration of the given Delta gene
@@ -826,7 +879,7 @@ inline void con_protein_her (cp_args& a, cph_indices i) {
 	notes:
 	todo:
 */
-inline void con_protein_delta (cp_args& a, cpd_indices i) {
+inline bool con_protein_delta (cp_args& a, cpd_indices i) {
 	double** r = a.rs;
 	double*** c = a.cl.cons;
 	int cell = a.stc.cell;
@@ -840,6 +893,10 @@ inline void con_protein_delta (cp_args& a, cpd_indices i) {
 		c[i.con_protein][tp][cell]
 		+ a.sd.step_size * (r[i.rate_synthesis][cell] * c[i.con_mrna][td][a.old_cells[i.old_cell]]
 		- r[i.rate_degradation][cell] * c[i.con_protein][tp][cell]);
+	if (c[i.con_protein][tc][cell]<0 || c[i.con_protein][tc][cell] > a.sd.max_con_thresh){
+		return false;
+	}
+	return true;
 }
 
 /* dimer_proteins calculates the concentrations of every dimer for a given cell
@@ -854,16 +911,19 @@ inline void con_protein_delta (cp_args& a, cpd_indices i) {
 
 	151221: added dimerization for mespamespa, mespamespb, mespbmespb
 */
-void dimer_proteins (sim_data& sd, double** rs, con_levels& baby_cl, st_context& stc) {
+bool  dimer_proteins (sim_data& sd, double** rs, con_levels& baby_cl, st_context& stc) {
 	cd_args cda(sd, rs, baby_cl, stc); // WRAPper for repeatedly used structs
-	
+	bool passed=true;
 	//Calculating dimer levels for dimer H1H1, H1H7, H1H13
 	for (int i = CPH1H1,       j = 0;   i <= CPH1H13;   i++, j++) {
 		/*while (sd.section == SEC_POST && CPH1MESPA <= i && i <= CPH1MESPB) { 
 			i++;
 			j++;
 		}*/
-		con_dimer(cda, i, j, cd_indices(CPH1, RDAH1H1, RDDIH1H1, RDDGH1H1));
+		passed = con_dimer(cda, i, j, cd_indices(CPH1, RDAH1H1, RDDIH1H1, RDDGH1H1));
+		if (!passed){
+			return false;
+		}	
 	}
 	
 	//  H7H7, H7H13
@@ -872,23 +932,36 @@ void dimer_proteins (sim_data& sd, double** rs, con_levels& baby_cl, st_context&
 			i++;
 			j++;
 		}*/
-		con_dimer(cda, i, j, cd_indices(CPH7, RDAH7H7, RDDIH7H7, RDDGH7H7));
+		passed= con_dimer(cda, i, j, cd_indices(CPH7, RDAH7H7, RDDIH7H7, RDDGH7H7));
+		if (!passed){
+			return false;
+		}
 	}
 	
 	//No MespA and MespB in posterior
 	if (sd.section == SEC_ANT) {
 		//CPMESPAMESPA,CPMESPAMESPB
 		for (int i = CPMESPAMESPA, j = 0;   i <= CPMESPAMESPB; i++, j++) {
-			con_dimer(cda, i, j, cd_indices(CPMESPA, RDAMESPAMESPA, RDDIMESPAMESPA, RDDGMESPAMESPA));
+			passed = con_dimer(cda, i, j, cd_indices(CPMESPA, RDAMESPAMESPA, RDDIMESPAMESPA, RDDGMESPAMESPA));
+			if (!passed){
+				return false;
+			}
 		}
 		//for (int i = CPMESPBMESPB, j = 0;   i <= CPMESPBH13;  i++, j++) {
 		
 		//CPMESPBMESPB
-		con_dimer(cda, CPMESPBMESPB, 0, cd_indices(CPMESPB, RDAMESPBMESPB, RDDIMESPBMESPB, RDDGMESPBMESPB));
+		passed = con_dimer(cda, CPMESPBMESPB, 0, cd_indices(CPMESPB, RDAMESPBMESPB, RDDIMESPBMESPB, RDDGMESPBMESPB));
+		if (!passed){
+			return false;
+		}
 		//}
 	}
 
-	con_dimer(cda, CPH13H13, 0, cd_indices(CPH13, RDAH13H13, RDDIH13H13, RDDGH13H13));//H13H13
+	passed = con_dimer(cda, CPH13H13, 0, cd_indices(CPH13, RDAH13H13, RDDIH13H13, RDDGH13H13));//H13H13
+	if (!passed){
+		return false;
+	}
+	return true;
 }
 
 /* con_dimer calculates the given dimer's concentration
@@ -904,7 +977,7 @@ void dimer_proteins (sim_data& sd, double** rs, con_levels& baby_cl, st_context&
 
 	151221: pay attention to the index for mesp genes
 */
-inline void con_dimer (cd_args& a, int con, int offset, cd_indices i) {
+inline bool con_dimer (cd_args& a, int con, int offset, cd_indices i) {
 	double** r = a.rs;	//active_rates
 	double*** c = a.cl.cons;	
 	int tc = a.stc.time_cur;	//current time step
@@ -925,6 +998,10 @@ inline void con_dimer (cd_args& a, int con, int offset, cd_indices i) {
 		+ a.sd.step_size * (r[i.rate_association + offset][cell] * c[i.con_protein][tp][cell] * c[i.con_protein + con_offset][tp][cell]
 			- r[i.rate_dissociation + offset][cell] * c[con][tp][cell]
 			- r[i.rate_degradation + offset][cell] * c[con][tp][cell]);
+	if (c[con][tc][cell]<0 || c[con][tc][cell] >a.sd.max_con_thresh){
+		return false;
+	}
+	return true;
 }
 
 /* mRNA_synthesis calculates the concentrations of every mRNA for a given cell
@@ -941,7 +1018,7 @@ inline void con_dimer (cd_args& a, int con, int offset, cd_indices i) {
 
 	151221: Added mRNA transcription for meps genes, pay attention to index of mesp genes
 */
-void mRNA_synthesis (sim_data& sd, double** rs, con_levels& baby_cl, st_context& stc, int old_cells_mrna[], mutant_data& md, bool past_induction, bool past_recovery) {
+bool mRNA_synthesis (sim_data& sd, double** rs, con_levels& baby_cl, st_context& stc, int old_cells_mrna[], mutant_data& md, bool past_induction, bool past_recovery) {
 	// Translate delays from minutes to time steps
 	int delays[NUM_INDICES];//6
 	for (int j = 0; j < NUM_INDICES; j++) {
@@ -1041,7 +1118,11 @@ void mRNA_synthesis (sim_data& sd, double** rs, con_levels& baby_cl, st_context&
 		baby_cl.cons[CMH1 + j][stc.time_cur][stc.cell] =
 			baby_cl.cons[CMH1 + j][stc.time_prev][stc.cell]
 			+ sd.step_size * (mtrans - rs[RMDH1 + j][stc.cell] * baby_cl.cons[CMH1 + j][stc.time_prev][stc.cell]);
+		if (baby_cl.cons[CMH1 + j][stc.time_cur][stc.cell] <0 || baby_cl.cons[CMH1 + j][stc.time_cur][stc.cell] > sd.max_con_thresh){
+			return false;
+		}
 	}
+	return true;
 }
 
 /* transcription calculates mRNA transcription, taking into account the effects of dimer repression
